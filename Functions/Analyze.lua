@@ -70,6 +70,7 @@ function dump_states(state_data)
 		mugen.log("State " .. k .. ":\n")
 		mugen.log("  Statetype: " .. st_to_c(v.statetype) .. "\n")
 		mugen.log("  Movetype: " .. mt_to_c(v.movetype) .. "\n")
+		if v.projectile ~= nil and v.projectile == true then mugen.log("  Projectile: yes\n") end
 		mugen.log("  Juggle points: " .. v.juggle .. "\n")
 		if v.power < 0 then mugen.log("  Power cost: " .. (v.power * -1) .. "\n") end
 		if v.power > 0 then mugen.log("  Power gain: " .. v.power .. "\n") end
@@ -113,10 +114,93 @@ function dump_states(state_data)
 	end
 end
 
+function process_hitdef(hitdef, partner)
+	local output = {type = 0, inair = false, throw = false, target_state = -1, prio_score = 0, animtype_score = 0, damage_score = 0, link_frames = 0, damage = 0, impact_velocities = {}}
+	-- main properties we care about in classifying the move:
+	---- affectteam: disqualifies the hitdef
+	---- hitdefattr, hitflag: normal/super/hyper, grounded/air, throw/non-throw, hitflags
+	---- damage, priority, animtype: indicator of how hard the hit is
+	---- p2stateno: throw indicator
+	---- timing-related: hitpausetime, hitshaketime, groundhittime, groundslidetime, airhittime
+	---- velocity-related: groundvelocity.x, groundvelocity.y, airvelocity.x, airvelocity.y
+	
+	-- confirm affectteam can actually hit the enemy
+	if hitdef.affectteam:constant() > 1 then
+		-- classifying move as normal,super,hyper (0,1,2)
+		local hda = hitdef.hitdefattr:constant()
+		if bitoper(hda, 2336, AND) ~= 0 then
+			output.type = 4
+		elseif bitoper(hda, 1168, AND) ~= 0 then
+			output.type = math.max(output.type, 3)
+		elseif bitoper(hda, 584, AND) ~= 0 then
+			output.type = math.max(output.type, 0)
+		end
+		
+		-- classifying move as air/ground (idc about stand vs crouch)
+		-- note if a move has 1 grounded and 1 air hitdef - we classify the whole move as air. (maybe not the best method.)
+		if bitoper(hda, 4, AND) ~= 0 then
+			output.inair = true
+		end
+		
+		-- classifying move as throw, based either on hitdefattr or p2stateno
+		-- (p2stateno is more accurate overall, but checking hitdefattr also helps capture the author's intent)
+		-- throws also get assigned hitdef.type of 2.5 (sitting between heavy and super)
+		if bitoper(hda, 448, AND) ~= 0 then
+			output.throw = true
+			output.type = 2.5
+		end
+		if hitdef.p2stateno:isconstant() and hitdef.p2stateno:constant() ~= -1 then
+			output.throw = true
+			output.type = 2.5
+			output.target_state = hitdef.p2stateno:constant()
+		end
+		
+		-- just store the move's hitflag as-is
+		output.hitflag = hitdef.hitflag:constant()
+		
+		-- assign scores for how hard the hit is - this is used to determine which moves are light, med, and hard
+		-- we take scores for priority, animtype, and damage, and average them out.
+		-- (this is ofc inaccurate, but since we can't easily parse the command triggers, this is next best thing for determining what moves can link)
+		if hitdef.priorityval:isconstant() then
+			output.prio_score = math.max(output.prio_score, hitdef.priorityval:constant())
+		end
+		
+		local animtype = hitdef.animtype:constant()
+		if animtype > 2 then animtype = 2 end
+		output.animtype_score = math.max(output.animtype_score, (animtype + 2) * 2)
+		
+		if hitdef.hitdamage:isconstant() then
+			local damage = hitdef.hitdamage:constant()
+			local damage_ratio = damage / partner:lifemax()
+			if damage_ratio > 0.10 then damage_ratio = 0.10 end
+			output.damage_score = math.max(output.damage_score, 70 * damage_ratio)
+			output.damage = damage
+		end
+		
+		-- try to assess how long the enemy's recovery will be on successful hit.
+		if hitdef.groundhittime:isconstant() then
+			local pauseframes = 0
+			if hitdef.hitpausetime:isconstant() then pauseframes = hitdef.hitpausetime:constant() end
+			output.link_frames = hitdef.groundhittime:constant() - pauseframes
+		end
+		
+		-- assess the impact velocities
+		if hitdef.groundvelocity.x:isconstant() then
+			local x = hitdef.groundvelocity.x:constant()
+			local y = 0.0
+			if hitdef.groundvelocity.y:isconstant() then y = hitdef.groundvelocity.y:constant() end
+			output.impact_velocities[#(output.impact_velocities) + 1] = {x = x, y = y}
+		end
+	else
+		mugen.log("Skipping affectteam = F HitDef in state " .. st:stateno() .. "\n")
+	end
+	return output
+end
+
 function userscript()
 	local current = player.current()
 	local partner = current:partner()
-	if _G['AI_ASSIST_ANALYSIS_RESULT_' .. partner:id()] ~= nil then return end
+	if _G['AI_ASSIST_ANALYSIS_RESULT_' .. partner:name()] ~= nil then return end
 	
 	local result = {}
 	mugen.log("Performing AI assist analysis of partner player with ID " .. partner:id() .. "\n")
@@ -244,7 +328,7 @@ function userscript()
 			}
 			
 			if jugglePoints:isconstant() then state_data[st:stateno()].juggle = jugglePoints:constant() end
-			if animationID:isconstant() then state_data[st:stateno()].anims[animationID:constant()] = animationID:constant() end
+			if animationID:isconstant() then state_data[st:stateno()].anims[#(state_data[st:stateno()].anims) + 1] = animationID:constant() end
 			if xvel:isconstant() then state_data[st:stateno()].velocities[1].x = xvel:constant() end
 			if yvel:isconstant() then state_data[st:stateno()].velocities[1].y = yvel:constant() end
 			if power:isconstant() then state_data[st:stateno()].power = power:constant() end
@@ -265,7 +349,7 @@ function userscript()
 					-- ChangeAnim: add to anims list
 					local target = controller:properties().value
 					if target:isconstant() then
-						state_data[st:stateno()].anims[target:constant()] = target:constant()
+						state_data[st:stateno()].anims[#(state_data[st:stateno()].anims) + 1] = target:constant()
 					end
 				elseif controller:type() == 0x18 then
 					-- VelSet: add to velocities list
@@ -308,86 +392,79 @@ function userscript()
 				elseif controller:type() == 0x25 then
 					-- HitDef: (most) hitdef properties are not stored directly. we use properties to help classify the kind of move this is.
 					-- to do this, we assign a score to each property, and use the overall relative scores (summed from all hitdefs) to determine move style.
-					local hitdef = controller:properties()
-					if state_data[st:stateno()].hitdef == nil then state_data[st:stateno()].hitdef = {type = 0, inair = false, throw = false, target_state = -1, prio_score = 0, animtype_score = 0, damage_score = 0, link_frames = 0, damage = 0} end
-					-- main properties we care about in classifying the move:
-					---- affectteam: disqualifies the hitdef
-					---- hitdefattr, hitflag: normal/super/hyper, grounded/air, throw/non-throw, hitflags
-					---- damage, priority, animtype: indicator of how hard the hit is
-					---- p2stateno: throw indicator
-					---- timing-related: hitpausetime, hitshaketime, groundhittime, groundslidetime, airhittime
-					---- velocity-related: groundvelocityx, groundvelocityy, airvelocityx, airvelocityy
-					
-					-- confirm affectteam can actually hit the enemy
-					if hitdef.affectteam:constant() > 1 then
-						-- classifying move as normal,super,hyper (0,1,2)
-						local hda = hitdef.hitdefattr:constant()
-						if bitoper(hda, 2336, AND) ~= 0 then
-							state_data[st:stateno()].hitdef.type = 4
-						elseif bitoper(hda, 1168, AND) ~= 0 then
-							state_data[st:stateno()].hitdef.type = math.max(state_data[st:stateno()].hitdef.type, 3)
-						elseif bitoper(hda, 584, AND) ~= 0 then
-							state_data[st:stateno()].hitdef.type = math.max(state_data[st:stateno()].hitdef.type, 0)
-						end
-						
-						-- classifying move as air/ground (idc about stand vs crouch)
-						-- note if a move has 1 grounded and 1 air hitdef - we classify the whole move as air. (maybe not the best method.)
-						if bitoper(hda, 4, AND) ~= 0 then
-							state_data[st:stateno()].hitdef.inair = true
-						end
-						
-						-- classifying move as throw, based either on hitdefattr or p2stateno
-						-- (p2stateno is more accurate overall, but checking hitdefattr also helps capture the author's intent)
-						-- throws also get assigned hitdef.type of 2.5 (sitting between heavy and super)
-						if bitoper(hda, 448, AND) ~= 0 then
-							state_data[st:stateno()].hitdef.throw = true
-							state_data[st:stateno()].hitdef.type = 2.5
-						end
-						if hitdef.p2stateno:isconstant() and hitdef.p2stateno:constant() ~= -1 then
-							state_data[st:stateno()].hitdef.throw = true
-							state_data[st:stateno()].hitdef.type = 2.5
-							state_data[st:stateno()].hitdef.target_state = hitdef.p2stateno:constant()
-						end
-						
-						-- just store the move's hitflag as-is
-						state_data[st:stateno()].hitdef.hitflag = hitdef.hitflag:constant()
-						
-						-- assign scores for how hard the hit is - this is used to determine which moves are light, med, and hard
-						-- we take scores for priority, animtype, and damage, and average them out.
-						-- (this is ofc inaccurate, but since we can't easily parse the command triggers, this is next best thing for determining what moves can link)
-						if hitdef.priorityval:isconstant() then
-							state_data[st:stateno()].hitdef.prio_score = math.max(state_data[st:stateno()].hitdef.prio_score, hitdef.priorityval:constant())
-						end
-						
-						local animtype = hitdef.animtype:constant()
-						if animtype > 2 then animtype = 2 end
-						state_data[st:stateno()].hitdef.animtype_score = math.max(state_data[st:stateno()].hitdef.animtype_score, (animtype + 2) * 2)
-						
-						if hitdef.hitdamage:isconstant() then
-							local damage = hitdef.hitdamage:constant()
-							local damage_ratio = damage / partner:lifemax()
-							if damage_ratio > 0.10 then damage_ratio = 0.10 end
-							state_data[st:stateno()].hitdef.damage_score = math.max(state_data[st:stateno()].hitdef.damage_score, 70 * damage_ratio)
-							state_data[st:stateno()].hitdef.damage = damage
-						end
-						
-						-- try to assess how long the enemy's recovery will be on successful hit.
-						if hitdef.groundhittime:isconstant() then
-							local pauseframes = 0
-							if hitdef.hitpausetime:isconstant() then pauseframes = hitdef.hitpausetime:constant() end
-							state_data[st:stateno()].hitdef.link_frames = hitdef.groundhittime:constant() - pauseframes
-						end
-						
-						-- assess the impact velocities
-						if hitdef.groundvelocityx:isconstant() then
-							local x = hitdef.groundvelocityx:constant()
-							local y = 0.0
-							if hitdef.groundvelocityy:isconstant() then y = hitdef.groundvelocityy:constant() end
-							state_data[st:stateno()].impact_velocities[#(state_data[st:stateno()].impact_velocities) + 1] = {x = x, y = y}
-						end
-					else
-						mugen.log("Skipping affectteam = F HitDef in state " .. st:stateno() .. "\n")
+					if state_data[st:stateno()].hitdef == nil then state_data[st:stateno()].hitdef = {type = 0, inair = false, throw = false, target_state = -1, prio_score = 0, animtype_score = 0, damage_score = 0, link_frames = 0, damage = 0, impact_velocities = {}} end
+					local hitdef = process_hitdef(controller:properties(), partner)
+
+					state_data[st:stateno()].hitdef.type = math.max(state_data[st:stateno()].hitdef.type, hitdef.type)
+					state_data[st:stateno()].hitdef.inair = state_data[st:stateno()].hitdef.inair or hitdef.inair
+					state_data[st:stateno()].hitdef.throw = state_data[st:stateno()].hitdef.throw or hitdef.throw
+					state_data[st:stateno()].hitdef.target_state = math.max(state_data[st:stateno()].hitdef.target_state, hitdef.target_state)
+					state_data[st:stateno()].hitdef.prio_score = math.max(state_data[st:stateno()].hitdef.prio_score, hitdef.prio_score)
+					state_data[st:stateno()].hitdef.animtype_score = math.max(state_data[st:stateno()].hitdef.animtype_score, hitdef.animtype_score)
+					state_data[st:stateno()].hitdef.damage_score = math.max(state_data[st:stateno()].hitdef.damage_score, hitdef.damage_score)
+					state_data[st:stateno()].hitdef.link_frames = math.min(state_data[st:stateno()].hitdef.link_frames, hitdef.link_frames)
+					state_data[st:stateno()].hitdef.damage = state_data[st:stateno()].hitdef.damage + hitdef.damage
+					for _,vel in pairs(hitdef.impact_velocities) do
+						state_data[st:stateno()].impact_velocities[#(state_data[st:stateno()].impact_velocities) + 1] = vel
 					end
+				elseif controller:type() == 0x27 then
+					-- Projectile: very similar to a HitDef (shares vast majority of properties).
+					-- we actually just perform the same analysis as a HitDef overall and then augment with some Projectile props. (this is because I am lazy.)
+					if state_data[st:stateno()].hitdef == nil then state_data[st:stateno()].hitdef = {type = 0, inair = false, throw = false, target_state = -1, prio_score = 0, animtype_score = 0, damage_score = 0, link_frames = 0, damage = 0, impact_velocities = {}} end
+					local hitdef = process_hitdef(controller:properties(), partner)
+
+					state_data[st:stateno()].hitdef.type = math.max(state_data[st:stateno()].hitdef.type, hitdef.type)
+					state_data[st:stateno()].hitdef.inair = state_data[st:stateno()].hitdef.inair or hitdef.inair
+					state_data[st:stateno()].hitdef.throw = state_data[st:stateno()].hitdef.throw or hitdef.throw
+					state_data[st:stateno()].hitdef.target_state = math.max(state_data[st:stateno()].hitdef.target_state, hitdef.target_state)
+					state_data[st:stateno()].hitdef.prio_score = math.max(state_data[st:stateno()].hitdef.prio_score, hitdef.prio_score)
+					state_data[st:stateno()].hitdef.animtype_score = math.max(state_data[st:stateno()].hitdef.animtype_score, hitdef.animtype_score)
+					state_data[st:stateno()].hitdef.damage_score = math.max(state_data[st:stateno()].hitdef.damage_score, hitdef.damage_score)
+					state_data[st:stateno()].hitdef.link_frames = math.min(state_data[st:stateno()].hitdef.link_frames, hitdef.link_frames)
+					state_data[st:stateno()].hitdef.damage = state_data[st:stateno()].hitdef.damage + hitdef.damage
+					for _,vel in pairs(hitdef.impact_velocities) do
+						state_data[st:stateno()].impact_velocities[#(state_data[st:stateno()].impact_velocities) + 1] = vel
+					end
+					
+					-- proj property handler
+					local projectile = controller:properties()
+					-- projanim - add to the animation list - when this gets iterated through it will get picked up
+					if projectile.projanim:isconstant() then state_data[st:stateno()].anims[#(state_data[st:stateno()].anims) + 1] = projectile.projanim:constant() end
+					-- projpriority - use to assign priority score
+					if projectile.projpriority:isconstant() then state_data[st:stateno()].hitdef.prio_score = math.max(state_data[st:stateno()].hitdef.prio_score, math.min(projectile.projpriority:constant(), 7))	end
+					-- velocities, accelerations, velmuls - treat as statedef velocities
+					-- compute an average effective velocity over the projectile's lifetime. lifetime is derived from the projremovetime (if available), or else from the smallest of the state's main animation length and the projectile's animation length.
+					local lifetime = 0
+					if projectile.projremovetime:isconstant() and projectile.projremovetime:constant() ~= -1 then
+						lifetime = projectile.projremovetime:constant()
+					else
+						local stateAnim = state_data[st:stateno()].anims[1]
+						local stateAnimLength = 9999
+						if stateAnim ~= nil then stateAnimLength = animation_data[stateAnim].length end
+						local projAnim = projectile.projanim:isconstant() and projectile.projanim:constant() or nil
+						local projAnimLength = 9999
+						if projAnim ~= nil then projAnimLength = animation_data[projAnim].length end
+						lifetime = math.min(projAnimLength, stateAnimLength)
+					end
+					
+					local velx = projectile.velocity.x:isconstant() and projectile.velocity.x:constant() or 0
+					local vely = projectile.velocity.y:isconstant() and projectile.velocity.y:constant() or 0
+					local addx = projectile.accel.x:isconstant() and projectile.accel.x:constant() or 0
+					local addy = projectile.accel.y:isconstant() and projectile.accel.y:constant() or 0
+					local mulx = projectile.velmul.x:isconstant() and projectile.velmul.x:constant() or 1
+					local muly = projectile.velmul.y:isconstant() and projectile.velmul.y:constant() or 1
+					
+					for i=0,math.min(lifetime, 300) do
+						velx = (velx + addx) * mulx
+						vely = (vely + addy) * muly
+					end
+					
+					velx = velx / lifetime
+					vely = vely / lifetime
+					
+					state_data[st:stateno()].velocities[#(state_data[st:stateno()].velocities) + 1] = {x = velx, y = vely}
+					
+					state_data[st:stateno()].projectile = true
 				end
 			end
 			
@@ -426,7 +503,7 @@ function userscript()
 	dump_animations(animation_data)
 	dump_states(state_data)
 	
-	_G['AI_ASSIST_ANALYSIS_RESULT_' .. partner:id()] = result
+	_G['AI_ASSIST_ANALYSIS_RESULT_' .. partner:name()] = result
 	mugen.log("AI assist analysis completed successfully.\n")
 end
 

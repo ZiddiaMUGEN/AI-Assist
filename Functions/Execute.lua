@@ -79,9 +79,9 @@ function userscript()
 	if enemy1 ~= nil then distance = math.min(distance, math.sqrt(((enemy1:pos().x - partner:pos().x) * (enemy1:pos().x - partner:pos().x)) + ((enemy1:pos().y - partner:pos().y) * (enemy1:pos().y - partner:pos().y)))) end
 	if enemy2 ~= nil then distance = math.min(distance, math.sqrt(((enemy2:pos().x - partner:pos().x) * (enemy2:pos().x - partner:pos().x)) + ((enemy2:pos().y - partner:pos().y) * (enemy2:pos().y - partner:pos().y)))) end
 	
-	if _G['AI_ASSIST_ANALYSIS_RESULT_' .. partner:id()] == nil then return end
+	if _G['AI_ASSIST_ANALYSIS_RESULT_' .. partner:name()] == nil then return end
 	
-	local ai_data = _G['AI_ASSIST_ANALYSIS_RESULT_' .. partner:id()]
+	local ai_data = _G['AI_ASSIST_ANALYSIS_RESULT_' .. partner:name()]
 	
 	-- disable default AI, don't need inputs interrupting!
 	partner:aienableset(false)
@@ -111,7 +111,9 @@ function userscript()
 	end
 	
 	-- only apply if we have control, OR if movecontact is met
-	if not partner:ctrl() and partner:movecontact() == 0 then return end
+	if not partner:ctrl() and partner:movecontact() == 0 then 
+		return 
+	end
 	
 	-- if the enemy is in range + attacking, and we have ctrl, we may want to guard instead of attack.
 	-- once enemy makes contact, we can take a chance to try to counter with a different attack.
@@ -137,11 +139,10 @@ function userscript()
 			-- flag for validity
 			local valid = false
 			-- check if the attack can connect. if yes, add to the list and continue.
-			-- note this is a little gimmicky, it treats all boxes as a single-frame clump of boxes, but this saves on execution time + my brainpower
 			-- it checks each anim in the list individually for connection, which is also a bit off but most skills use 1 anim anyway
 			for _,animno in pairs(statedef.anims) do
 				local animdata = ai_data.animation_data[animno]
-				if #(animdata.boxes) > 0 then
+				if animdata ~= nil and #(animdata.boxes) > 0 then
 					for i=1,#(animdata.boxes) do
 						local extents = {left = animdata.boxes[i].left, right = animdata.boxes[i].right, bottom = animdata.boxes[i].bottom, top = animdata.boxes[i].top}
 						-- add position and fixup with facing to screen coords
@@ -254,12 +255,12 @@ function userscript()
 			end
 		end
 	end
-	
-	-- force garbage collector to run
-	-- note this doesn't actually run it every frame, but it will force it to run more regularly
-	-- for some reason it never runs without including this
-	collectgarbage("restart")
 end
+
+-- force garbage collector params correctly before executing script proper
+collectgarbage("setpause", 100)
+collectgarbage("setstepmul", 200)
+collectgarbage("restart")
 
 local co = coroutine.create(userscript)
 local status, err = coroutine.resume(co)
